@@ -30,9 +30,7 @@ module.exports =
 		'arrow-parens': [ 2, 'always' ],
 		'arrow-spacing': 2,
 		'block-spacing': [ 2, 'always' ],
-		'brace-style': [ 2, 'allman', { allowSingleLine: true } ],
 		'camelcase': 2,
-		'comma-dangle': 2,
 		'comma-spacing': [ 2, { before: false, after: true } ],
 		'comma-style': 2,
 		'computed-property-spacing': 2,
@@ -41,21 +39,6 @@ module.exports =
 		'generator-star-spacing': 2,
 		'guard-for-in': 2,
 		'indent': [ 2, 'tab', { 'SwitchCase': 1 } ],
-		'key-spacing': [ 2,
-		{
-			singleLine:
-			{
-				beforeColon: false,
-				afterColon: true
-			},
-			multiLine:
-			{
-				beforeColon: true,
-				afterColon: true,
-				align: 'colon'
-			}
-		}],
-		'keyword-spacing': 2,
 		'linebreak-style': [ 2, 'unix' ],
 		'lines-around-comment': [ 2,
 		{
@@ -73,7 +56,6 @@ module.exports =
 			ignoreTemplateLiterals: true,
 			ignoreRegExpLiterals: true
 		}],
-		'newline-after-var': 2,
 		'newline-before-return': 2,
 		'newline-per-chained-call': 2,
 		'no-alert': 2,

@@ -5,9 +5,9 @@ const protooServer = require('protoo-server');
 const Logger = require('./Logger');
 const config = require('../config');
 
-const MAX_BITRATE = config.mediasoup.maxBitrate || 1000000;
-const MIN_BITRATE = Math.min(50000, MAX_BITRATE);
-const BITRATE_FACTOR = 0.75;
+const MAX_BITRATE = config.mediasoup.maxBitrate || 1500000;
+const DEFAULT_BITRATE = config.mediasoup.defaultBitrate || 500000;
+const MIN_BITRATE = 20000;
 
 const logger = new Logger('Room');
 
@@ -15,7 +15,7 @@ class Room extends EventEmitter
 {
 	constructor(roomId, mediaServer)
 	{
-		logger.info('constructor() [roomId:"%s"]', roomId);
+		logger.debug('constructor() [roomId:"%s"]', roomId);
 
 		super();
 		this.setMaxListeners(Infinity);
@@ -25,6 +25,9 @@ class Room extends EventEmitter
 
 		// Closed flag.
 		this._closed = false;
+
+		// bandwidth
+		this._bandwidth = DEFAULT_BITRATE;
 
 		try
 		{
@@ -41,9 +44,6 @@ class Room extends EventEmitter
 			throw error;
 		}
 
-		// Current max bitrate for all the participants.
-		this._maxBitrate = MAX_BITRATE;
-
 		// Current active speaker.
 		// @type {mediasoup.Peer}
 		this._currentActiveSpeaker = null;
@@ -58,7 +58,7 @@ class Room extends EventEmitter
 
 	close()
 	{
-		logger.debug('close()');
+		logger.debug('close() [roomId:"%s"]', this._roomId);
 
 		this._closed = true;
 
@@ -79,23 +79,23 @@ class Room extends EventEmitter
 		if (!this._mediaRoom)
 			return;
 
-		logger.info(
+		logger.debug(
 			'logStatus() [room id:"%s", protoo peers:%s, mediasoup peers:%s]',
 			this._roomId,
 			this._protooRoom.peers.length,
 			this._mediaRoom.peers.length);
 	}
 
-	handleConnection(peerName, transport)
+	handleConnection(peerName, transport, auth2)
 	{
-		logger.info('handleConnection() [peerName:"%s"]', peerName);
+		logger.debug('handleConnection() [peerName:"%s"]', peerName);
 
 		if (this._protooRoom.hasPeer(peerName))
 		{
 			logger.warn(
 				'handleConnection() | there is already a peer with same peerName, ' +
-				'closing the previous one [peerName:"%s"]',
-				peerName);
+				'closing the previous one [mcuIndex:%d, roomId:"%s", peerName:"%s"]',
+				this.mcuIndex, this._roomId, peerName);
 
 			const protooPeer = this._protooRoom.getPeer(peerName);
 
@@ -104,6 +104,17 @@ class Room extends EventEmitter
 
 		const protooPeer = this._protooRoom.createPeer(peerName, transport);
 
+		// assume joinnet max bitrate is MAX: 10000000
+		protooPeer.maxJoinnetBitrate = 10000000;
+
+		// send auth info to the client
+		protooPeer.send('auth', { 'hash': auth2 })
+			.catch(() => { 
+				logger.error(
+					'connection [mcuIndex:%d, roomId:"%s", peerName:"%s"] is rejected due to mismatch auth',
+					this.mcuIndex, this._roomId, peerName);
+			});
+		
 		this._handleProtooPeer(protooPeer);
 	}
 
@@ -117,7 +128,7 @@ class Room extends EventEmitter
 		{
 			if (activePeer)
 			{
-				logger.info('new active speaker [peerName:"%s"]', activePeer.name);
+				logger.debug('new active speaker [peerName:"%s"]', activePeer.name);
 
 				this._currentActiveSpeaker = activePeer;
 
@@ -144,7 +155,7 @@ class Room extends EventEmitter
 			}
 			else
 			{
-				logger.info('no active speaker');
+				logger.debug('no active speaker');
 
 				this._currentActiveSpeaker = null;
 
@@ -272,9 +283,34 @@ class Room extends EventEmitter
 					break;
 				}
 
+				case 'change-bitrate':
+				{
+					accept();
+
+					const { bitrate } = request.data;
+					protooPeer.maxJoinnetBitrate = bitrate;
+					logger.debug('protoo Peer [mcuIndex:%d, roomId:"%s", peer:"%s"] joinnet change max bitrate to %s',
+						this.mcuIndex, this._roomId, protooPeer.id, bitrate);
+						
+					const { mediaPeer } = protooPeer.data;
+					if(mediaPeer) {
+						const { transports } = mediaPeer;
+						if(transports) {
+							for(const transport of transports) {
+								if(transport.direction === 'send') {
+									this._updateMaxBitrate(transport, protooPeer);
+								}
+							}
+						}
+					}
+
+					break;
+				}
+				
 				default:
 				{
-					logger.error('unknown request.method "%s"', request.method);
+					logger.error('unknown request.method "%s" [mcuIndex:%d, roomId:"%s", peerName:"%s"]',
+						request.method, this.mcuIndex, this._roomId, protooPeer.id);
 
 					reject(400, `unknown request.method "${request.method}"`);
 				}
@@ -283,7 +319,8 @@ class Room extends EventEmitter
 
 		protooPeer.on('close', () =>
 		{
-			logger.debug('protoo Peer "close" event [peer:"%s"]', protooPeer.id);
+			logger.info('protoo Peer "close" event [mcuIndex:%d, roomId:"%s", peer:"%s"]',
+				this.mcuIndex, this._roomId, protooPeer.id);
 
 			const { mediaPeer } = protooPeer.data;
 
@@ -300,8 +337,8 @@ class Room extends EventEmitter
 				if (this._mediaRoom.peers.length === 0)
 				{
 					logger.info(
-						'last peer in the room left, closing the room [roomId:"%s"]',
-						this._roomId);
+						'last peer in the room left, closing the room [mcuIndex:%d, roomId:"%s"]',
+						this.mcuIndex, this._roomId);
 
 					this.close();
 				}
@@ -319,19 +356,16 @@ class Room extends EventEmitter
 
 		mediaPeer.on('newtransport', (transport) =>
 		{
-			logger.info(
+			logger.debug(
 				'mediaPeer "newtransport" event [peer.name:%s, transport.id:%s, direction:%s]',
 				mediaPeer.name, transport.id, transport.direction);
 
 			// Update peers max sending  bitrate.
 			if (transport.direction === 'send')
 			{
-				this._updateMaxBitrate();
-
-				transport.on('close', () =>
-				{
-					this._updateMaxBitrate();
-				});
+				// reset the old max bitrate to 0
+				transport.oldMaxBitrate = 0;
+				this._updateMaxBitrate(transport, protooPeer);
 			}
 
 			this._handleMediaTransport(transport);
@@ -339,14 +373,14 @@ class Room extends EventEmitter
 
 		mediaPeer.on('newproducer', (producer) =>
 		{
-			logger.info('mediaPeer "newproducer" event [id:%s]', producer.id);
+			logger.debug('mediaPeer "newproducer" event [id:%s]', producer.id);
 
 			this._handleMediaProducer(producer);
 		});
 
 		mediaPeer.on('newconsumer', (consumer) =>
 		{
-			logger.info('mediaPeer "newconsumer" event [id:%s]', consumer.id);
+			logger.debug('mediaPeer "newconsumer" event [id:%s]', consumer.id);
 
 			this._handleMediaConsumer(consumer);
 		});
@@ -354,7 +388,7 @@ class Room extends EventEmitter
 		// Also handle already existing Consumers.
 		for (const consumer of mediaPeer.consumers)
 		{
-			logger.info('mediaPeer existing "consumer" [id:%s]', consumer.id);
+			logger.debug('mediaPeer existing "consumer" [id:%s]', consumer.id);
 
 			this._handleMediaConsumer(consumer);
 		}
@@ -375,7 +409,7 @@ class Room extends EventEmitter
 	{
 		transport.on('close', (originator) =>
 		{
-			logger.info(
+			logger.debug(
 				'Transport "close" event [originator:%s]', originator);
 		});
 	}
@@ -384,19 +418,19 @@ class Room extends EventEmitter
 	{
 		producer.on('close', (originator) =>
 		{
-			logger.info(
+			logger.debug(
 				'Producer "close" event [originator:%s]', originator);
 		});
 
 		producer.on('pause', (originator) =>
 		{
-			logger.info(
+			logger.debug(
 				'Producer "pause" event [originator:%s]', originator);
 		});
 
 		producer.on('resume', (originator) =>
 		{
-			logger.info(
+			logger.debug(
 				'Producer "resume" event [originator:%s]', originator);
 		});
 	}
@@ -405,25 +439,25 @@ class Room extends EventEmitter
 	{
 		consumer.on('close', (originator) =>
 		{
-			logger.info(
+			logger.debug(
 				'Consumer "close" event [originator:%s]', originator);
 		});
 
 		consumer.on('pause', (originator) =>
 		{
-			logger.info(
+			logger.debug(
 				'Consumer "pause" event [originator:%s]', originator);
 		});
 
 		consumer.on('resume', (originator) =>
 		{
-			logger.info(
+			logger.debug(
 				'Consumer "resume" event [originator:%s]', originator);
 		});
 
 		consumer.on('effectiveprofilechange', (profile) =>
 		{
-			logger.info(
+			logger.debug(
 				'Consumer "effectiveprofilechange" event [profile:%s]', profile);
 		});
 
@@ -495,8 +529,8 @@ class Room extends EventEmitter
 				if (!mediaPeer)
 				{
 					logger.error(
-						'cannot handle mediasoup request, no mediasoup Peer [method:"%s"]',
-						request.method);
+						'cannot handle mediasoup request, no mediasoup Peer [method:"%s"] [mcuIndex:%d, roomId:"%s", peerName:"%s"]',
+						request.method, this.mcuIndex, this._roomId, protooPeer.id);
 
 					reject(400, 'no mediasoup Peer');
 				}
@@ -504,7 +538,7 @@ class Room extends EventEmitter
 				// TODO: Temporal to catch a possible bug.
 				if (request.method === 'createTransport')
 				{
-					logger.info(
+					logger.debug(
 						'"createTransport" request [peer.name:%s, transport.id:%s, direction:%s]',
 						mediaPeer.name, request.id, request.direction);
 				}
@@ -529,8 +563,8 @@ class Room extends EventEmitter
 		if (!mediaPeer)
 		{
 			logger.error(
-				'cannot handle mediasoup notification, no mediasoup Peer [method:"%s"]',
-				notification.method);
+				'cannot handle mediasoup notification, no mediasoup Peer [method:"%s"] [mcuIndex:%d, roomId:"%s", peerName:"%s"]',
+				notification.method, this.mcuIndex, this._roomId, protooPeer.id);
 
 			return;
 		}
@@ -538,49 +572,25 @@ class Room extends EventEmitter
 		mediaPeer.receiveNotification(notification);
 	}
 
-	_updateMaxBitrate()
+	_updateMaxBitrate(transport, protooPeer)
 	{
 		if (this._mediaRoom.closed)
 			return;
 
-		const numPeers = this._mediaRoom.peers.length;
-		const previousMaxBitrate = this._maxBitrate;
-		let newMaxBitrate;
+		let newMaxBitrate = Math.min(this._bandwidth, protooPeer.maxJoinnetBitrate);
+		newMaxBitrate = Math.min(MAX_BITRATE, (Math.max(MIN_BITRATE, newMaxBitrate)));
 
-		if (numPeers <= 2)
-		{
-			newMaxBitrate = MAX_BITRATE;
+		if(transport.oldMaxBitrate != newMaxBitrate) {
+			logger.debug('protoo Peer [mcuIndex:%d, roomId:"%s", peer:"%s", transportId:%s] set webrtc MaxBitrate from %d to %d',
+				this.mcuIndex, this._roomId, protooPeer.id, transport.id,
+				transport.oldMaxBitrate, newMaxBitrate);
+			transport.oldMaxBitrate = newMaxBitrate;
+			transport.setMaxBitrate(newMaxBitrate)
+				.catch((error) => {
+					logger.error('protoo Peer [mcuIndex:%d, roomId:"%s", peer:"%s", transportId:%s] setMaxBitrate failed: %s',
+						this.mcuIndex, this._roomId, protooPeer.id, transport.id, String(error));
+				});
 		}
-		else
-		{
-			newMaxBitrate = Math.round(MAX_BITRATE / ((numPeers - 1) * BITRATE_FACTOR));
-
-			if (newMaxBitrate < MIN_BITRATE)
-				newMaxBitrate = MIN_BITRATE;
-		}
-
-		this._maxBitrate = newMaxBitrate;
-
-		for (const peer of this._mediaRoom.peers)
-		{
-			for (const transport of peer.transports)
-			{
-				if (transport.direction === 'send')
-				{
-					transport.setMaxBitrate(newMaxBitrate)
-						.catch((error) =>
-						{
-							logger.error('transport.setMaxBitrate() failed: %s', String(error));
-						});
-				}
-			}
-		}
-
-		logger.info(
-			'_updateMaxBitrate() [num peers:%s, before:%skbps, now:%skbps]',
-			numPeers,
-			Math.round(previousMaxBitrate / 1000),
-			Math.round(newMaxBitrate / 1000));
 	}
 }
 

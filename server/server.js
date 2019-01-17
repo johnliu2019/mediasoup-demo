@@ -2,8 +2,11 @@
 
 'use strict';
 
-process.title = 'mediasoup-demo-server';
+process.title = 'mediasoup-server';
+process.env.DEBUG = 'mediasoup-server:INFO* mediasoup-server:WARN* mediasoup-server:ERROR*';
+// process.env.DEBUG = 'mediasoup-server*';
 
+const webrtcServerVersion = '1.0.0';
 const config = require('./config');
 
 /* eslint-disable no-console */
@@ -20,14 +23,22 @@ const mediasoup = require('mediasoup');
 const readline = require('readline');
 const colors = require('colors/safe');
 const repl = require('repl');
+const WebSocket = require('ws');
 const Logger = require('./lib/Logger');
 const Room = require('./lib/Room');
 const homer = require('./lib/homer');
 
 const logger = new Logger();
+const mcuLogger = new Logger('MCU');
 
 // Map of Room instances indexed by roomId.
 const rooms = new Map();
+
+// mcu list
+const mcuArray = [];
+
+// meeting session list
+const sessionList = {};
 
 // mediasoup server.
 const mediaServer = mediasoup.Server(
@@ -90,9 +101,9 @@ const httpsServer = https.createServer(tls, (req, res) =>
 	res.end();
 });
 
-httpsServer.listen(3443, '0.0.0.0', () =>
+httpsServer.listen(config.mediasoup.signalServerPort, '0.0.0.0', () =>
 {
-	logger.info('protoo WebSocket server running');
+	logger.info('webrtc server %s running at port %d', webrtcServerVersion, config.mediasoup.signalServerPort);
 });
 
 // Protoo WebSocket server.
@@ -111,6 +122,7 @@ webSocketServer.on('connectionrequest', (info, accept, reject) =>
 	const u = url.parse(info.request.url, true);
 	const roomId = u.query['roomId'];
 	const peerName = u.query['peerName'];
+	const hash = u.query['hash'];
 
 	if (!roomId || !peerName)
 	{
@@ -121,25 +133,77 @@ webSocketServer.on('connectionrequest', (info, accept, reject) =>
 		return;
 	}
 
-	logger.info(
-		'connection request [roomId:"%s", peerName:"%s"]', roomId, peerName);
+	if(!hash) {
+		logger.warn(
+			'connection request [roomId:"%s", peerName:"%s"] has no hash', roomId, peerName);
+
+		reject(400, 'Connection request without hash');
+
+		return;
+	}
+
+	// check whether the session is active at mcu
+	const mysession = sessionList[roomId];
+	if(!mysession) {
+		logger.warn(
+			'connection request [roomId:"%s", peerName:"%s"] no session info found', roomId, peerName);
+
+		reject(400, 'Connection request no session info found');
+
+		return;
+	}
+	const mcuIndex = mysession.mcuIndex;
+	const sessionInfo = mysession.bandwidth || 0;
+
+	// check the auth
+	if(!mysession[peerName]) {
+		logger.warn(
+			'connection request [mcuIndex:%d, roomId:"%s", peerName:"%s"] no auth info found', mcuIndex, roomId, peerName);
+
+		reject(400, 'Connection request no auth info found');
+
+		return;
+	}
+	const auth = mysession[peerName].value1;
+	if(auth != hash) {
+		logger.warn(
+			'connection request [mcuIndex:%d, roomId:"%s", peerName:"%s"] auth info not match', mcuIndex, roomId, peerName);
+
+		reject(400, 'Connection request auth info not match');
+
+		return;
+	}
+
+	let auth2;
+		
+	auth2 = mysession[peerName].value2;
+	auth2 = auth2 || '';
 
 	let room;
 
 	// If an unknown roomId, create a new Room.
 	if (!rooms.has(roomId))
 	{
-		logger.info('creating a new Room [roomId:"%s"]', roomId);
+		logger.debug('creating a new Room [mcuIndex:%d, roomId:"%s", peerName:"%s"]', mcuIndex, roomId, peerName);
 
 		try
 		{
 			room = new Room(roomId, mediaServer);
 
+			room.mcuIndex = mcuIndex;
+
 			global.APP_ROOM = room;
+			if(sessionInfo) {
+				room._bandwidth = sessionInfo;
+				logger.info(
+					'new Room [mcuIndex:%d, roomId:"%s"] created upon connection from [peerName:"%s"] uses bandwidth of %d',
+					mcuIndex, roomId, peerName, sessionInfo);
+			}
 		}
 		catch (error)
 		{
-			logger.error('error creating a new Room: %s', error);
+			logger.error('error creating a new Room [mcuIndex:%d, roomId:"%s", peerName:"%s"]: %s',
+				mcuIndex, roomId, peerName, error);
 
 			reject(error);
 
@@ -166,8 +230,230 @@ webSocketServer.on('connectionrequest', (info, accept, reject) =>
 
 	const transport = accept();
 
-	room.handleConnection(peerName, transport);
+	room.handleConnection(peerName, transport, auth2);
+
+	let peerNo1;
+	try {
+		peerNo1 = room._protooRoom.peers.length;
+	} catch(e) { 
+		peerNo1 = 'unknown';
+	}
+	logger.info(
+		'[mcuIndex:%d, roomId:"%s", peerName:"%s"] joins the room[total: %s]',
+		mcuIndex, roomId, peerName, peerNo1);
 });
+
+// connect to MCU
+function array2str(data) {
+	let text;
+	try {
+		text = String.fromCharCode.apply(null, data);
+	} catch(e) {
+		text = '';
+		let i;
+		for(i = 0; i < data.length; i++) {
+			text += String.fromCharCode(data[i]);
+		}
+	}
+
+	return text;
+}
+
+function clearMcuSession(mcuIndex) {
+	const thisMcu = mcuArray[mcuIndex];
+	const mcu = thisMcu.mcu;
+	for(const key in sessionList) {
+		if(Object.prototype.hasOwnProperty.call(sessionList, key)) {
+			const mysession = sessionList[key];
+			if(mysession.mcuIndex == mcuIndex) {
+				delete sessionList[key];
+				mcuLogger.info('[%d]%s, clear session %s', mcuIndex, mcu, key);
+			}
+		}
+	}
+}
+
+function delayedConnectMCU(mcuIndex) {
+	const thisMcu = mcuArray[mcuIndex];
+	if(thisMcu.retryCount < 10) {
+		thisMcu.retryCount++;
+	}
+
+	let delay = 1 << thisMcu.retryCount;
+	if(delay > 60) {
+		delay = 60;
+	}
+
+	setTimeout(() => {
+		connectMCU(mcuIndex);
+	}, delay * 1000);
+}
+
+function connectMCU(mcuIndex) {
+	const thisMcu = mcuArray[mcuIndex];
+	const mcu = thisMcu.mcu;
+
+	const ws = new WebSocket(mcu, 'hmtg');
+	const timeoutThreshold = 9 * 1000;
+	let timeoutID = null;
+
+	mcuLogger.info('connecting to [%d]%s', mcuIndex, mcu);
+
+	ws.binaryType = 'arraybuffer';
+	function turnOnTimer() {
+		turnOffTimer();
+		timeoutID = setTimeout(function() {
+			timeoutID = null;
+			mcuLogger.info('[%d]%s, connection timeout', mcuIndex, mcu);
+			ws.onclose = ws.onerror = null;
+			ws.terminate();
+			clearMcuSession(mcuIndex);
+			delayedConnectMCU(mcuIndex);
+		}, timeoutThreshold);
+	}
+
+	function turnOffTimer() {
+		if(timeoutID != null) {
+			clearTimeout(timeoutID);
+			timeoutID = null;
+		}
+	}
+
+	ws.onopen = function(evt) {
+		thisMcu.retryCount = 0;
+		mcuLogger.info('connected with [%d]%s', mcuIndex, mcu);
+		turnOnTimer();
+	};
+
+	ws.onclose = function(evt) {
+		mcuLogger.info('[%d]%s, connection is closed', mcuIndex, mcu);
+		ws.onerror = null;
+		ws.terminate();
+		turnOffTimer();
+		clearMcuSession(mcuIndex);
+		delayedConnectMCU(mcuIndex);
+	};
+	ws.onerror = function(evt) {
+		mcuLogger.info('[%d]%s, connection is broken', mcuIndex, mcu);
+		ws.onclose = null;
+		ws.terminate();
+		turnOffTimer();
+		clearMcuSession(mcuIndex);
+		delayedConnectMCU(mcuIndex);
+	};
+	ws.onmessage = function(evt) {
+		let object;
+		let raw;
+
+		try {
+			raw = array2str(new Uint8Array(evt.data));
+
+			object = JSON.parse(raw);
+		}
+		catch(error) {
+			mcuLogger.error('[%d]%s parse error(%s) | invalid JSON: %s', mcuIndex, mcu, raw, error);
+
+			return;
+		}
+
+		if(typeof object !== 'object' || Array.isArray(object)) {
+			mcuLogger.error('[%d]%s parse error(%s) | not an object', mcuIndex, mcu, raw);
+
+			return;
+		}
+
+		if(typeof object.type !== 'string') {
+			mcuLogger.error('[%d]%s parse error(%s) | type is not string', mcuIndex, mcu, raw);
+
+			return;
+		}
+
+		turnOnTimer();
+
+		if(object.type == 'idle') {
+			return;
+		}
+
+		if(object.type == 'error') {
+			let errorText = '';
+
+			if(typeof object.text === 'string') {
+				errorText = object.text;
+			}
+
+			mcuLogger.info('[%d]%s encounter error %s, abort', mcuIndex, mcu, errorText);
+			ws.onclose = ws.onerror = null;
+			ws.terminate();
+			turnOffTimer();
+
+			return;
+		}
+
+		if(object.type == 'session1') {
+			if(typeof object.session === 'string'
+				&& typeof object.bandwidth === 'number'
+				&& object.session) {
+
+				const session = sessionList[object.session] || {};
+				sessionList[object.session] = session;
+
+				session.mcuIndex = mcuIndex;
+				session.bandwidth = object.bandwidth;
+
+				mcuLogger.info('[%d]%s, add session %s, bandwidth %d', mcuIndex, mcu, object.session, object.bandwidth);
+
+				return;
+			}
+		}
+
+		if(object.type == 'session2') {
+			if(typeof object.session === 'string' && object.session) {
+				if(sessionList[object.session]) {
+					delete sessionList[object.session];
+
+					mcuLogger.info('[%d]%s, delete session %s', mcuIndex, mcu, object.session);
+				}
+
+				return;
+			}
+		}
+
+		if(object.type == 'auth') {
+			if(typeof object.session === 'string'
+				&& typeof object.ssrc === 'number'
+				&& typeof object.value1 === 'string'
+				&& typeof object.value2 === 'string'
+				&& object.session
+				&& object.value1
+				&& object.value2) {
+				if(sessionList[object.session]) {
+
+					const session = sessionList[object.session];
+
+					session[object.ssrc] = { value1: object.value1, value2: object.value2 };
+
+					mcuLogger.info('[%d]%s, add user, session=%s, ssrc=%d', mcuIndex, mcu, object.session, object.ssrc);
+				}
+
+				return;
+			}
+		}
+
+		mcuLogger.info('unknown or invalid data from [%d]%s: %s', mcuIndex, mcu, raw);
+	};
+}
+
+let i;
+for(i = 0; i < config.mediasoup.mcu.length; i++) {
+	const thisMcu = {};
+	mcuArray.push(thisMcu);
+
+	thisMcu.mcu = config.mediasoup.mcu[i];
+	thisMcu.retryCount = 0;
+	thisMcu.mcuIndex = i;
+
+	connectMCU(i);
+}
 
 // Listen for keyboard input.
 

@@ -2,7 +2,7 @@
 
 const debug = require('debug');
 
-const APP_NAME = 'mediasoup-demo-server';
+const APP_NAME = 'mediasoup-server';
 
 class Logger
 {
@@ -26,8 +26,8 @@ class Logger
 		/* eslint-disable no-console */
 		this._debug.log = console.info.bind(console);
 		this._info.log = console.info.bind(console);
-		this._warn.log = console.warn.bind(console);
-		this._error.log = console.error.bind(console);
+		this._warn.log = console.info.bind(console);
+		this._error.log = console.info.bind(console);
 		/* eslint-enable no-console */
 	}
 
